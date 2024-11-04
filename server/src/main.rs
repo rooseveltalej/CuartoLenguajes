@@ -1,9 +1,8 @@
-use actix_web::{web, App, HttpServer, Responder, HttpResponse, get, post, Result};
+use actix_web::{web, App, HttpServer, Responder, HttpResponse, get, post, HttpRequest};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use actix_cors::Cors;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum SeatState {
@@ -63,15 +62,48 @@ impl Estadio {
 
     fn crear_categorias() -> HashMap<CategoriaZona, Vec<Vec<Seat>>> {
         let mut categorias = HashMap::new();
-        categorias.insert(CategoriaZona::VIP, Self::crear_matriz_asientos(3, 5, vec![(0, 0, SeatState::Reservado), (1, 2, SeatState::Comprado)]));
-        categorias.insert(CategoriaZona::Regular, Self::crear_matriz_asientos(7, 5, vec![(0, 1, SeatState::Libre), (2, 3, SeatState::Reservado)]));
-        categorias.insert(CategoriaZona::Sol, Self::crear_matriz_asientos(5, 5, vec![(2, 2, SeatState::Comprado), (4, 4, SeatState::Libre)]));
-        categorias.insert(CategoriaZona::Platea, Self::crear_matriz_asientos(6, 5, vec![(3, 3, SeatState::Libre), (2, 2, SeatState::Reservado)]));
+        categorias.insert(
+            CategoriaZona::VIP,
+            Self::crear_matriz_asientos(
+                3,
+                5,
+                vec![(0, 0, SeatState::Reservado), (1, 2, SeatState::Comprado)],
+            ),
+        );
+        categorias.insert(
+            CategoriaZona::Regular,
+            Self::crear_matriz_asientos(
+                7,
+                5,
+                vec![(0, 1, SeatState::Libre), (2, 3, SeatState::Reservado)],
+            ),
+        );
+        categorias.insert(
+            CategoriaZona::Sol,
+            Self::crear_matriz_asientos(
+                5,
+                5,
+                vec![(2, 2, SeatState::Comprado), (4, 4, SeatState::Libre)],
+            ),
+        );
+        categorias.insert(
+            CategoriaZona::Platea,
+            Self::crear_matriz_asientos(
+                6,
+                5,
+                vec![(3, 3, SeatState::Libre), (2, 2, SeatState::Reservado)],
+            ),
+        );
         categorias
     }
 
-    fn crear_matriz_asientos(filas: usize, asientos_por_fila: usize, estados: Vec<(usize, usize, SeatState)>) -> Vec<Vec<Seat>> {
-        let mut matriz = vec![vec![Seat { estado: SeatState::Libre }; asientos_por_fila]; filas];
+    fn crear_matriz_asientos(
+        filas: usize,
+        asientos_por_fila: usize,
+        estados: Vec<(usize, usize, SeatState)>,
+    ) -> Vec<Vec<Seat>> {
+        let mut matriz =
+            vec![vec![Seat { estado: SeatState::Libre }; asientos_por_fila]; filas];
 
         for (fila, numero, estado) in estados {
             if fila < filas && numero < asientos_por_fila {
@@ -105,48 +137,86 @@ async fn get_stadium_structure(data: web::Data<SharedEstadio>) -> impl Responder
 }
 
 #[post("/reserve_seat")]
-async fn reserve_seat(data: web::Data<SharedEstadio>, info: web::Json<SeatRequest>) -> impl Responder {
-    let SeatRequest { categoria, zona, fila, asiento } = info.into_inner();
+async fn reserve_seat(
+    req: HttpRequest,
+    data: web::Data<SharedEstadio>,
+    info: web::Json<SeatRequest>,
+) -> impl Responder {
+    // Obtener la dirección IP y el puerto del cliente
+    if let Some(peer_addr) = req.peer_addr() {
+        println!("Dirección IP y puerto del cliente: {}", peer_addr);
+        let port = peer_addr.port();
+        println!("Puerto del cliente: {}", port);
+    } else {
+        println!("No se pudo obtener la dirección del cliente.");
+    }
+
+    let SeatRequest {
+        categoria,
+        zona,
+        fila,
+        asiento,
+    } = info.into_inner();
     let mut estadio = data.lock().unwrap();
 
+    // Convertir la categoría de String a CategoriaZona
+    let categoria_enum = match categoria.as_str() {
+        "VIP" => CategoriaZona::VIP,
+        "Regular" => CategoriaZona::Regular,
+        "Sol" => CategoriaZona::Sol,
+        "Platea" => CategoriaZona::Platea,
+        _ => {
+            return HttpResponse::BadRequest().body("Categoría inválida.");
+        }
+    };
+
+    // Buscar la zona y categoría especificadas
     for zona_obj in &mut estadio.zonas {
         if zona_obj.nombre == zona {
-            if let Some(asientos) = zona_obj.categorias.get_mut(&CategoriaZona::VIP) { // Cambiar para usar la categoría correcta
-                if fila > 0 && fila <= asientos.len() && asiento > 0 && asiento <= asientos[0].len() {
+            if let Some(asientos) = zona_obj.categorias.get_mut(&categoria_enum) {
+                if fila > 0 && fila <= asientos.len() && asiento > 0 && asiento <= asientos[0].len()
+                {
                     let current_seat = &mut asientos[fila - 1][asiento - 1];
                     if current_seat.estado == SeatState::Libre {
                         current_seat.estado = SeatState::ReservadoPorUsuario;
                         return HttpResponse::Ok().body("Asiento reservado con éxito.");
                     } else {
-                        return HttpResponse::BadRequest().body("El asiento no está disponible para reserva.");
+                        return HttpResponse::BadRequest()
+                            .body("El asiento no está disponible para reserva.");
                     }
+                } else {
+                    return HttpResponse::BadRequest()
+                        .body("Número de fila o asiento fuera de rango.");
                 }
+            } else {
+                return HttpResponse::BadRequest()
+                    .body("Categoría no encontrada en la zona especificada.");
             }
         }
     }
 
-    HttpResponse::NotFound().body("Asiento no encontrado o fuera de rango.")
-    }
+    HttpResponse::NotFound().body("Zona no encontrada.")
+}
 
-    #[actix_web::main]
-    async fn main() -> std::io::Result<()> {
-        let estadio = Arc::new(Mutex::new(Estadio::new()));
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let estadio = Arc::new(Mutex::new(Estadio::new()));
 
-        HttpServer::new(move || {
-            let cors = Cors::default()
+    HttpServer::new(move || {
+        let cors = Cors::default()
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
             .supports_credentials();
 
-            App::new()
-                .wrap(cors)
-                .app_data(web::Data::new(Arc::clone(&estadio)))
-                .service(health_check)
-                .service(get_stadium_structure)
-                .service(reserve_seat)
-        })
-        .bind("127.0.0.1:8080")?
-        .run()
-        .await
-    }
+        App::new()
+            .wrap(cors)
+            .app_data(web::Data::new(Arc::clone(&estadio)))
+            .service(health_check)
+            .service(get_stadium_structure)
+            .service(reserve_seat)
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
+}
