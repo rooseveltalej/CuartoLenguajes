@@ -1,0 +1,15 @@
+[package]
+name = "proyecto1"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+regex = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.15"
+futures-util = "0.3"
+actix-web = "4.0"
+actix-cors = "0.6"
+
