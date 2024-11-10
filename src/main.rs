@@ -1,4 +1,6 @@
-use actix_web::{web, App, HttpServer, Responder, HttpResponse, get, post};
+use actix::prelude::*;
+use actix_web::{web, App, HttpServer, Responder, HttpResponse, get, post, Error, HttpRequest};
+use actix_web_actors::ws;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -7,6 +9,7 @@ use tokio::time::{sleep, Duration};
 use rand::Rng;
 use uuid::Uuid;
 use log::{info, error};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum SeatState {
@@ -14,7 +17,7 @@ enum SeatState {
     Reservado,
     ReservadoPorUsuario,
     Comprado,
-    ReservadoTemporalmente, // Nuevo estado
+    ReservadoTemporalmente,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -83,6 +86,13 @@ struct ReservaTemporal {
     asientos: Vec<(String, CategoriaZona, usize, usize)>, // (zona, categoría, fila, asiento)
     tiempo_expiracion: std::time::Instant,
 }
+
+#[derive(Debug, Deserialize)]
+struct CancelarReservaRequest {
+    reserva_id: String,
+}
+
+
 
 impl Estadio {
     fn new() -> Self {
@@ -252,6 +262,50 @@ async fn get_stadium_structure(data: web::Data<SharedEstadio>) -> impl Responder
     HttpResponse::Ok().json(&*estadio)
 }
 
+#[post("/cancelar_reserva")]
+async fn cancelar_reserva(
+    data: web::Data<SharedEstadio>,
+    reservas: web::Data<SharedReservasTemporales>,
+    info: web::Json<CancelarReservaRequest>,
+    ws_server: web::Data<Addr<WsServer>>,
+) -> impl Responder {
+    info!("Solicitud para cancelar reserva: {:?}", info);
+
+    let mut estadio = data.lock().unwrap();
+    let mut reservas_temporales = reservas.lock().unwrap();
+
+    if let Some(reserva) = reservas_temporales.remove(&info.reserva_id) {
+        for (zona_nombre, categoria, fila, asiento) in reserva.asientos {
+            for zona in &mut estadio.zonas {
+                if zona.nombre == zona_nombre {
+                    if let Some(asientos_categoria) = zona.categorias.get_mut(&categoria) {
+                        let seat = &mut asientos_categoria[fila][asiento];
+                        if seat.estado == SeatState::ReservadoTemporalmente {
+                            seat.estado = SeatState::Libre;
+                            info!(
+                                "Reserva cancelada: Asiento liberado: Zona {}, Categoría {:?}, Fila {}, Asiento {}",
+                                zona_nombre, categoria, fila, asiento
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enviar actualización a los clientes
+        let estadio_json = serde_json::to_string(&*estadio).unwrap();
+        ws_server.do_send(BroadcastMessage(estadio_json));
+
+        // Devolver true en caso de éxito
+        return HttpResponse::Ok().body("true");
+    } else {
+        // Devolver false si la reserva no existe
+        return HttpResponse::Ok().body("false");
+    }
+}
+
+
+
 #[post("/buscar_asientos")]
 async fn buscar_asientos(
     data: web::Data<SharedEstadio>,
@@ -272,6 +326,7 @@ async fn reservar_asientos_temporalmente(
     data: web::Data<SharedEstadio>,
     reservas: web::Data<SharedReservasTemporales>,
     info: web::Json<ReservaTemporalRequest>,
+    ws_server: web::Data<Addr<WsServer>>,
 ) -> impl Responder {
     info!("Solicitud para reservar asientos temporalmente: {:?}", info);
 
@@ -324,10 +379,15 @@ async fn reservar_asientos_temporalmente(
 
     reservas_temporales.insert(reserva_id.clone(), reserva);
 
+    // Enviar actualización a los clientes
+    let estadio_json = serde_json::to_string(&*estadio).unwrap();
+    ws_server.do_send(BroadcastMessage(estadio_json));
+
     // Iniciar el temporizador para liberar los asientos después de 5 minutos
     let data_clone = data.clone();
     let reservas_clone = reservas.clone();
     let reserva_id_clone = reserva_id.clone();
+    let ws_server_clone = ws_server.clone();
 
     tokio::spawn(async move {
         sleep(Duration::from_secs(300)).await; // Esperar 5 minutos
@@ -352,6 +412,10 @@ async fn reservar_asientos_temporalmente(
                     }
                 }
             }
+
+            // Enviar actualización a los clientes
+            let estadio_json = serde_json::to_string(&*estadio).unwrap();
+            ws_server_clone.do_send(BroadcastMessage(estadio_json));
         }
     });
 
@@ -363,6 +427,7 @@ async fn confirmar_compra(
     data: web::Data<SharedEstadio>,
     reservas: web::Data<SharedReservasTemporales>,
     info: web::Json<ConfirmarCompraRequest>,
+    ws_server: web::Data<Addr<WsServer>>,
 ) -> impl Responder {
     info!("Solicitud para confirmar compra: {:?}", info);
 
@@ -386,6 +451,11 @@ async fn confirmar_compra(
                 }
             }
         }
+
+        // Enviar actualización a los clientes
+        let estadio_json = serde_json::to_string(&*estadio).unwrap();
+        ws_server.do_send(BroadcastMessage(estadio_json));
+
         // Devolver true en caso de éxito
         return HttpResponse::Ok().body("true");
     } else {
@@ -410,6 +480,154 @@ async fn procesar_pago(info: web::Json<ProcesarPagoRequest>) -> impl Responder {
     }
 }
 
+// Definiciones para WebSocket
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct BroadcastMessage(String);
+
+#[derive(Message)]
+#[rtype(result = "usize")]
+struct Connect {
+    addr: Recipient<BroadcastMessage>,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Disconnect {
+    id: usize,
+}
+
+struct WsSession {
+    id: usize,
+    hb: Instant,
+    addr: Addr<WsServer>,
+}
+
+impl Actor for WsSession {
+    type Context = ws::WebsocketContext<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        self.hb = Instant::now();
+
+        let addr = ctx.address();
+        self.addr
+            .send(Connect {
+                addr: addr.recipient(),
+            })
+            .into_actor(self)
+            .then(|res, act, ctx| {
+                match res {
+                    Ok(id) => {
+                        act.id = id;
+                    }
+                    _ => {
+                        ctx.stop();
+                    }
+                }
+                async {}.into_actor(act)
+            })
+            .wait(ctx);
+    }
+
+    fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        self.addr.do_send(Disconnect { id: self.id });
+        Running::Stop
+    }
+}
+
+impl Handler<BroadcastMessage> for WsSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: BroadcastMessage, ctx: &mut Self::Context) {
+        ctx.text(msg.0);
+    }
+}
+
+impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
+    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
+        match msg {
+            Ok(ws::Message::Ping(msg)) => {
+                self.hb = Instant::now();
+                ctx.pong(&msg);
+            }
+            Ok(ws::Message::Pong(_)) => {
+                self.hb = Instant::now();
+            }
+            Ok(ws::Message::Text(_text)) => {
+                // Aquí puedes manejar mensajes entrantes del cliente si es necesario
+            }
+            Ok(ws::Message::Close(_)) => {
+                ctx.stop();
+            }
+            _ => (),
+        }
+    }
+}
+
+struct WsServer {
+    sessions: HashMap<usize, Recipient<BroadcastMessage>>,
+    next_id: usize,
+}
+
+impl WsServer {
+    fn new() -> Self {
+        WsServer {
+            sessions: HashMap::new(),
+            next_id: 1,
+        }
+    }
+}
+
+impl Actor for WsServer {
+    type Context = Context<Self>;
+}
+
+impl Handler<Connect> for WsServer {
+    type Result = usize;
+
+    fn handle(&mut self, msg: Connect, _: &mut Context<Self>) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.sessions.insert(id, msg.addr);
+        id
+    }
+}
+
+impl Handler<Disconnect> for WsServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: Disconnect, _: &mut Context<Self>) {
+        self.sessions.remove(&msg.id);
+    }
+}
+
+impl Handler<BroadcastMessage> for WsServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: BroadcastMessage, _: &mut Context<Self>) {
+        for addr in self.sessions.values() {
+            let _ = addr.do_send(BroadcastMessage(msg.0.clone()));
+        }
+    }
+}
+
+// Handler para el endpoint WebSocket
+
+async fn ws_index(
+    req: HttpRequest,
+    stream: web::Payload,
+    srv: web::Data<Addr<WsServer>>,
+) -> Result<HttpResponse, Error> {
+    let ws_session = WsSession {
+        id: 0,
+        hb: Instant::now(),
+        addr: srv.get_ref().clone(),
+    };
+
+    ws::start(ws_session, &req, stream)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
@@ -417,6 +635,7 @@ async fn main() -> std::io::Result<()> {
     let estadio = Arc::new(Mutex::new(Estadio::new()));
     let reservas_temporales = Arc::new(Mutex::new(HashMap::<String, ReservaTemporal>::new()));
 
+    let ws_server = WsServer::new().start();
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -425,17 +644,21 @@ async fn main() -> std::io::Result<()> {
             .allow_any_header()
             .supports_credentials();
 
-        App::new()
+            App::new()
             .wrap(cors)
             .app_data(web::Data::new(Arc::clone(&estadio)))
             .app_data(web::Data::new(Arc::clone(&reservas_temporales)))
+            .app_data(web::Data::new(ws_server.clone()))
             .service(health_check)
             .service(get_stadium_structure)
             .service(buscar_asientos)
             .service(reservar_asientos_temporalmente)
             .service(confirmar_compra)
             .service(procesar_pago)
+            .service(cancelar_reserva) // Agrega este servicio
+            .route("/ws", web::get().to(ws_index))
     })
+    
     .bind("127.0.0.1:8080")?
     .run()
     .await

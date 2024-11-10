@@ -1,8 +1,6 @@
 import sys
 import requests
 import json
-import asyncio
-import threading
 
 from PyQt5.QtGui import QPainter
 from PyQt5.QtWidgets import (
@@ -26,7 +24,6 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QColor, QPen, QBrush
 from PyQt5.QtCore import QRectF, Qt, QTimer, QObject, pyqtSignal, QUrl
 
-# Importar QWebSocket para el manejo de WebSockets
 from PyQt5.QtWebSockets import QWebSocket
 
 class StadiumAPI:
@@ -82,7 +79,6 @@ class StadiumAPI:
                 }
             )
             response.raise_for_status()
-            # Leer el texto de la respuesta y convertirlo a booleano
             content = response.text.strip()
             if content == "true":
                 return True
@@ -103,15 +99,31 @@ class StadiumAPI:
                 }
             )
             response.raise_for_status()
-            return response.json()
+            content = response.text.strip()
+            if content == "true":
+                return {"aprobado": True}
+            else:
+                return {"aprobado": False}
         except requests.RequestException as e:
             StadiumAPI.show_error(f"Error al procesar el pago: {e}")
-            return None
+            return {"aprobado": False}
 
     @staticmethod
-    def liberar_asientos(reserva_id):
-        # En este ejemplo, no se implementa la liberación manual, ya que los asientos se liberan automáticamente tras el temporizador
-        pass
+    def cancelar_reserva(reserva_id):
+        try:
+            response = requests.post(
+                f"{StadiumAPI.BASE_URL}/cancelar_reserva",
+                json={"reserva_id": reserva_id}
+            )
+            response.raise_for_status()
+            content = response.text.strip()
+            if content == "true":
+                return True
+            else:
+                return False
+        except requests.RequestException as e:
+            StadiumAPI.show_error(f"Error al cancelar la reserva: {e}")
+            return False
 
     @staticmethod
     def show_error(message):
@@ -308,9 +320,26 @@ class StadiumView(QGraphicsView):
             seat.update_state("Sugerido")
 
     def handle_updates(self, data):
-        # Este método debería actualizar el estado de los asientos basado en los datos recibidos
-        # Aquí deberías implementar la lógica para actualizar los asientos en la interfaz
-        pass  # Implementación pendiente
+        for zona in data['zonas']:
+            zona_nombre = zona['nombre']
+            if zona_nombre in self.seats_map:
+                self.update_zone(zona_nombre, zona)
+
+    def update_zone(self, zona_nombre, zona_data):
+        for categoria_key, asientos in zona_data['categorias'].items():
+            categoria = categoria_key
+            if categoria in self.seats_map[zona_nombre]:
+                self.update_category(zona_nombre, categoria, asientos)
+
+    def update_category(self, zona_nombre, categoria, asientos_data):
+        seats_list = self.seats_map[zona_nombre][categoria]
+        for i, fila in enumerate(asientos_data):
+            for j, asiento_data in enumerate(fila):
+                seat = next((s for s in seats_list if s.row == i and s.column == j), None)
+                if seat:
+                    new_state = asiento_data['estado']
+                    if seat.state != new_state:
+                        seat.update_state(new_state)
 
     def wheelEvent(self, event):
         """Maneja el evento de la rueda del mouse para zoom"""
@@ -339,6 +368,7 @@ class WebSocketClient(QObject):
         print("Desconectado del servidor WebSocket.")
 
     def on_message(self, message):
+        print("Mensaje recibido del WebSocket")
         data = json.loads(message)
         self.update_received.emit(data)
 
@@ -370,7 +400,7 @@ class LegendWidget(QWidget):
             label.setStyleSheet(f"color: {color}")
             layout.addWidget(label)
 
-
+## Plugin de pago
 class MetodoPago:
     def iniciar_pago(self):
         raise NotImplementedError
@@ -414,12 +444,12 @@ class PagoTarjeta(MetodoPago):
         return False
 
     def validar_informacion(self):
-        # Solo verificar que algún campo tenga información
-        return any(self.detalles.values())
+        # Verificar que todos los campos tengan información
+        return all(self.detalles.values())
 
     def procesar_pago(self):
-        # Simular un pago exitoso sin llamar al servidor
-        return {"aprobado": True, "mensaje": "Pago simulado exitosamente con tarjeta."}
+        # Llamar al servidor para procesar el pago
+        return StadiumAPI.procesar_pago("Tarjeta", self.detalles)
 
 
 class PagoPayPal(MetodoPago):
@@ -451,12 +481,12 @@ class PagoPayPal(MetodoPago):
         return False
 
     def validar_informacion(self):
-        # Solo verificar que algún campo tenga información
-        return any(self.detalles.values())
+        # Verificar que todos los campos tengan información
+        return all(self.detalles.values())
 
     def procesar_pago(self):
-        # Simular un pago exitoso sin llamar al servidor
-        return {"aprobado": True, "mensaje": "Pago simulado exitosamente con PayPal."}
+        # Llamar al servidor para procesar el pago
+        return StadiumAPI.procesar_pago("PayPal", self.detalles)
 
 
 class PagoCripto(MetodoPago):
@@ -485,12 +515,12 @@ class PagoCripto(MetodoPago):
         return False
 
     def validar_informacion(self):
-        # Solo verificar que algún campo tenga información
-        return any(self.detalles.values())
+        # Verificar que todos los campos tengan información
+        return all(self.detalles.values())
 
     def procesar_pago(self):
-        # Simular un pago exitoso sin llamar al servidor
-        return {"aprobado": True, "mensaje": "Pago simulado exitosamente con criptomoneda."}
+        # Llamar al servidor para procesar el pago
+        return StadiumAPI.procesar_pago("Criptomoneda", self.detalles)
 
 
 class SearchControls(QWidget):
@@ -499,7 +529,7 @@ class SearchControls(QWidget):
         self.stadium_view = stadium_view
         self.setup_ui()
         self.reserva_id = None
-        self.asientos_reservados = []
+        self.asientos_sugeridos = []
         self.timer = None
 
     def setup_ui(self):
@@ -527,6 +557,12 @@ class SearchControls(QWidget):
         self.search_button = QPushButton("Buscar asientos")
         self.search_button.clicked.connect(self.search_seats)
         layout.addWidget(self.search_button)
+
+        # Botón para reservar asientos
+        self.reserve_button = QPushButton("Reservar")
+        self.reserve_button.clicked.connect(self.reserve_seats)
+        self.reserve_button.setEnabled(False)
+        layout.addWidget(self.reserve_button)
 
         # Botón para confirmar compra
         self.confirm_button = QPushButton("Confirmar Compra")
@@ -561,26 +597,33 @@ class SearchControls(QWidget):
 
             if asientos_encontrados:
                 self.stadium_view.highlight_seats(asientos_encontrados)
-                self.asientos_reservados = [(fila, columna) for fila, columna in result['asientos']]
+                self.asientos_sugeridos = [(fila, columna) for fila, columna in result['asientos']]
                 self.zona_reservada = zona
                 self.categoria_reservada = categoria
 
-                # Reservar asientos temporalmente
-                reserva = StadiumAPI.reservar_asientos_temporalmente(
-                    zona, categoria, self.asientos_reservados
-                )
-                if reserva and 'reserva_id' in reserva:
-                    self.reserva_id = reserva['reserva_id']
-                    self.confirm_button.setEnabled(True)
-                    self.cancel_button.setEnabled(True)
-                    self.start_timer()
-                else:
-                    self.reserva_id = None
-                    self.asientos_reservados = []
+                self.reserve_button.setEnabled(True)
+                self.confirm_button.setEnabled(False)
+                self.cancel_button.setEnabled(True)
             else:
                 QMessageBox.information(self, "Información", "No se encontraron asientos disponibles.")
         else:
             QMessageBox.information(self, "Información", "No se encontraron asientos consecutivos disponibles.")
+
+    def reserve_seats(self):
+        # Reservar asientos temporalmente
+        reserva = StadiumAPI.reservar_asientos_temporalmente(
+            self.zona_reservada, self.categoria_reservada, self.asientos_sugeridos
+        )
+        if reserva and 'reserva_id' in reserva:
+            self.reserva_id = reserva['reserva_id']
+            self.confirm_button.setEnabled(True)
+            self.cancel_button.setEnabled(True)
+            self.reserve_button.setEnabled(False)
+            self.start_timer()
+        else:
+            self.reserva_id = None
+            self.asientos_sugeridos = []
+            QMessageBox.warning(self, "Error", "No se pudieron reservar los asientos.")
 
     def start_timer(self):
         # Iniciar temporizador de 5 minutos
@@ -594,7 +637,9 @@ class SearchControls(QWidget):
         self.stadium_view.reset_suggested_seats()
         self.confirm_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
+        self.reserve_button.setEnabled(False)
         self.timer.stop()
+        self.reserva_id = None
 
     def confirm_purchase(self):
         # Iniciar proceso de pago
@@ -616,7 +661,10 @@ class SearchControls(QWidget):
                     self.stadium_view.reset_suggested_seats()
                     self.confirm_button.setEnabled(False)
                     self.cancel_button.setEnabled(False)
-                    self.timer.stop()
+                    self.reserve_button.setEnabled(False)
+                    if self.timer:
+                        self.timer.stop()
+                    self.reserva_id = None
                 else:
                     QMessageBox.warning(self, "Error", "No se pudo confirmar la compra.")
             else:
@@ -625,13 +673,22 @@ class SearchControls(QWidget):
             QMessageBox.warning(self, "Datos inválidos", "La información de pago es inválida.")
 
     def cancel_purchase(self):
-        # Liberar asientos reservados temporalmente (se liberarán automáticamente)
+        # Enviar solicitud al servidor para cancelar la reserva
+        if self.reserva_id:
+            cancelacion = StadiumAPI.cancelar_reserva(self.reserva_id)
+            if cancelacion:
+                QMessageBox.information(self, "Reserva cancelada", "La reserva ha sido cancelada.")
+            else:
+                QMessageBox.warning(self, "Error", "No se pudo cancelar la reserva.")
+            self.reserva_id = None
+
+        # Restablecer los asientos sugeridos
         self.stadium_view.reset_suggested_seats()
         self.confirm_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
+        self.reserve_button.setEnabled(False)
         if self.timer:
             self.timer.stop()
-        QMessageBox.information(self, "Operación cancelada", "La reserva ha sido cancelada.")
 
 
 class StadiumWindow(QMainWindow):
